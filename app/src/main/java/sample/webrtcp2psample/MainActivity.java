@@ -1,10 +1,10 @@
 package sample.webrtcp2psample;
 
+import android.graphics.Color;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
-import android.widget.NumberPicker;
 import android.widget.SeekBar;
 
 import com.koushikdutta.async.future.Future;
@@ -23,20 +23,37 @@ import org.webrtc.SdpObserver;
 import org.webrtc.SessionDescription;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 public class MainActivity extends AppCompatActivity {
     private final static String TAG = "MainActivity";
 
-    private final static List<PeerConnection.IceServer> iceServers = Arrays.asList(new PeerConnection.IceServer("stun:stun.l.google.com:19302"));
+    private final static List<PeerConnection.IceServer> iceServers = Arrays.asList(
+            new PeerConnection.IceServer("stun:stun.l.google.com:19302"),
+            new PeerConnection.IceServer("stun:stun1.l.google.com:19302"),
+            new PeerConnection.IceServer("stun:stun2.l.google.com:19302"),
+            new PeerConnection.IceServer("stun:stun3.l.google.com:19302")
+    );
+
+    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+
 
     private PeerConnection peerConnection;
 
     private Future<WebSocket> wsf;
 
     private DataChannel dataChannel;
+
+    private MySdpObserver sdpObserver = new MySdpObserver();
+
+    private MediaConstraints mediaConstraints = new MediaConstraints();
+
+    private DataChannel.Observer dataChannelObserver = new DataChannelObserver();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -50,71 +67,64 @@ public class MainActivity extends AppCompatActivity {
             }
             Log.d(TAG, "WebSocket が繋がりました");
             ws.setStringCallback(s -> {
-                String textToReceiveSdp = "";
+                JSONObject message;
+                String type;
+                String sdp;
+                JSONObject ice;
+                String sdpMid;
+                String candidate;
+                int sdpMLineIndex;
                 try {
-                    JSONObject message = new JSONObject(s);
-                    String type = message.getString("type");
+                    message = new JSONObject(s);
+                    Log.d(TAG, message.toString(4));
+                    type = message.getString("type").toLowerCase();
+                    if (!type.equals("candidate")) {
+                        sdp = message.getString("sdp");
+                        ice = null;
+                        sdpMid = null;
+                        sdpMLineIndex = 0;
+                        candidate = null;
+                    } else {
+                        sdp = null;
+                        ice = message.getJSONObject("ice");
+                        sdpMid = ice.getString("sdpMid");
+                        sdpMLineIndex = ice.getInt("sdpMLineIndex");
+                        candidate = ice.getString("candidate");
+                    }
+                } catch (JSONException e) {
+                    Log.e(TAG, "JSON の形式が不正です。", e);
+                    return;
+                }
+                executor.execute(() -> {
+                    SessionDescription sd = null;
                     switch (type) {
                         case "offer":
                             Log.d(TAG, "Received offer ...");
-                            peerConnection = prepareNewConnection();
-                            peerConnection.setRemoteDescription(new SdpObserver() {
-                                @Override
-                                public void onCreateSuccess(SessionDescription sessionDescription) {
-
-                                }
-
-                                @Override
-                                public void onSetSuccess() {
-
-                                }
-
-                                @Override
-                                public void onCreateFailure(String s) {
-
-                                }
-
-                                @Override
-                                public void onSetFailure(String s) {
-
-                                }
-                            }, new SessionDescription(SessionDescription.Type.OFFER, message.getString("sdp")));
+                            prepareNewConnection();
+                            sd = new SessionDescription(
+                                    SessionDescription.Type.OFFER,
+                                    sdp);
+                            peerConnection.setRemoteDescription(sdpObserver, sd);
                             break;
                         case "answer":
                             Log.d(TAG, "Received answer ...");
-                            peerConnection.setRemoteDescription(new SdpObserver() {
-                                @Override
-                                public void onCreateSuccess(SessionDescription sessionDescription) {
-
-                                }
-
-                                @Override
-                                public void onSetSuccess() {
-
-                                }
-
-                                @Override
-                                public void onCreateFailure(String s) {
-
-                                }
-
-                                @Override
-                                public void onSetFailure(String s) {
-
-                                }
-                            }, new SessionDescription(SessionDescription.Type.ANSWER, message.getString("sdp")));
+                            sd = new SessionDescription(SessionDescription.Type.ANSWER, sdp);
+                            peerConnection.setRemoteDescription(sdpObserver, sd);
                             break;
                         case "candidate":
-                            Log.d(TAG, "Received ICE candidate ...");
-
-                            peerConnection.addIceCandidate(new IceCandidate("gamedata", 0, message.getString("candidate")));
+                            Log.d(TAG, String.format("Received ICE candidate ... sdpMid: %s, sdpMLineIndex: %d, candidate: %s", sdpMid, sdpMLineIndex, candidate));
+                            if (peerConnection != null) {
+                                peerConnection.addIceCandidate(new IceCandidate(sdpMid, sdpMLineIndex, candidate));
+                            }
                             break;
                     }
 
-                } catch (JSONException e) {
-                    Log.e(TAG, "JSON の形式が不正です。", e);
-                }
-
+                });
+                executor.execute(() -> {
+                    if (type.equals("offer")) {
+                        peerConnection.createAnswer(sdpObserver, mediaConstraints);
+                    }
+                });
 
             });
         });
@@ -122,39 +132,71 @@ public class MainActivity extends AppCompatActivity {
 
     }
 
-    private PeerConnection prepareNewConnection() {
-        if (!PeerConnectionFactory.initializeAndroidGlobals(this.getApplicationContext(), false, false, false, null)) {
-            Log.e(TAG, "PeerConnectionFactory の初期化に失敗しました");
+    private void prepareNewConnection() {
+        mediaConstraints.optional.add(
+                new MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"));
+        mediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"));
+        mediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"));
+
+        // Initialize field trials.
+        PeerConnectionFactory.initializeFieldTrials("");
+
+
+        // video  使わないけど true にしないと new PeerConnectionFactory(options) で例外発生
+        // http://stackoverflow.com/questions/29499725/new-peerconnectionfactory-gives-error-on-android
+        // https://bugs.chromium.org/p/webrtc/issues/detail?id=3416
+        if (!PeerConnectionFactory.initializeAndroidGlobals(this.getApplicationContext(), true, false, false)) {
+            Log.d(TAG, "Failed to initializeAndroidGlobals");
         }
-        PeerConnectionFactory peerConnectionFactory = new PeerConnectionFactory();
-        dataChannel = peerConnection.createDataChannel("gamedata", new DataChannel.Init());
-        return peerConnectionFactory.createPeerConnection(iceServers, new MediaConstraints(), new PeerConnection.Observer() {
+        // Options 指定しない方が ICE Candedate が正しそう。
+        //PeerConnectionFactory.Options options = new PeerConnectionFactory.Options();
+        //options.networkIgnoreMask = 0;
+        PeerConnectionFactory peerConnectionFactory = new PeerConnectionFactory(null);
+        peerConnection = peerConnectionFactory.createPeerConnection(iceServers, mediaConstraints, new PeerConnection.Observer() {
             @Override
             public void onSignalingChange(PeerConnection.SignalingState signalingState) {
-                Log.d(TAG, "onSignalingChange");
+                Log.d(TAG, "onSignalingChange: " + signalingState);
             }
 
             @Override
             public void onIceConnectionChange(PeerConnection.IceConnectionState iceConnectionState) {
-                Log.d(TAG, "onIceConnectionChange");
+                Log.d(TAG, "onIceConnectionChange: " + iceConnectionState);
+            }
+
+            @Override
+            public void onIceConnectionReceivingChange(boolean b) {
+                Log.d(TAG, "onIceConnectionReceivingChange: " + b);
             }
 
             @Override
             public void onIceGatheringChange(PeerConnection.IceGatheringState iceGatheringState) {
-                Log.d(TAG, "onIceGatheringChange");
+                Log.d(TAG, "onIceGatheringChange: " + iceGatheringState);
             }
 
             @Override
             public void onIceCandidate(IceCandidate iceCandidate) {
-                String message = String.format("{ \"type\": \"candidate\", ice: \"%s\" }", iceCandidate.sdp);
+                Log.d(TAG, "onIceCandidate");
+                if (iceCandidate == null) {
+                    return;
+                }
+                String message = String.format(Locale.ENGLISH, "{\"type\":\"candidate\",\"ice\":{\"candidate\":\"%s\",\"sdpMid\":\"%s\",\"sdpMLineIndex\":\"%d\"}}",
+                        iceCandidate.sdp,
+                        iceCandidate.sdpMid,
+                        iceCandidate.sdpMLineIndex
+                );
+                Log.d(TAG, "onIceCandidate: " + message);
                 wsf.setCallback((e, ws) -> {
-                    Log.d(TAG, "onIceCandedate");
                     if (e != null) {
                         Log.e(TAG, "onIceCandedate で例外が発生しました。", e);
                         return;
                     }
                     ws.send(message);
                 });
+            }
+
+            @Override
+            public void onIceCandidatesRemoved(IceCandidate[] iceCandidates) {
+                Log.d(TAG, "onIceCandidatesRemoved: " + iceCandidates.length);
             }
 
             @Override
@@ -169,92 +211,122 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onDataChannel(DataChannel dc) {
-                dataChannel = dc;
-                Log.d(TAG, "ondatachannel");
-                dataChannel.registerObserver(new DataChannel.Observer() {
-                    @Override
-                    public void onStateChange() {
-                        Log.d(TAG, "DataChannel onStateChange: " + dataChannel.state().name());
-                    }
-
-                    @Override
-                    public void onMessage(DataChannel.Buffer buffer) {
-                        String color = String.format("#%X%X%X", buffer.data.get(), buffer.data.get(), buffer.data.get());
-                        Log.d(TAG, "color: " + color);
-                    }
+                executor.execute(() -> {
+                    dataChannel = dc;
+                    Log.d(TAG, "ondatachannel: " + dc.label());
+                    dc.registerObserver(dataChannelObserver);
                 });
             }
 
             @Override
             public void onRenegotiationNeeded() {
-
+                Log.d(TAG, "onRenegotiationNeeded");
             }
         });
+        if (sdpObserver.initiator) {
+            DataChannel.Init init = new DataChannel.Init();
+            init.negotiated = false;
+            init.ordered = true;
+            init.id = 1;
+            dataChannel = peerConnection.createDataChannel("gamedata", init);
+            dataChannel.registerObserver(dataChannelObserver);
+        }
     }
 
     public void makeOffer(View view) {
         if (peerConnection != null) {
             return;
         }
-        peerConnection = prepareNewConnection();
-        peerConnection.createOffer(new SdpObserver() {
-            @Override
-            public void onCreateSuccess(SessionDescription sessionDescription) {
-                Log.d(TAG, "createOffer onCreateSuccess");
-                peerConnection.setLocalDescription(new SdpObserver() {
-                    @Override
-                    public void onCreateSuccess(SessionDescription sessionDescription) {
-                        Log.d(TAG, "setLocalDescription onCreateSuccess");
-                        wsf.setCallback((e, ws) -> {
-                            if (e != null) {
-                                Log.e(TAG, "WebSocket の通信で例外", e);
-                            }
-                            ws.send(sessionDescription.description);
-                            Log.d(TAG, "SDP=" + sessionDescription.description);
-                        });
-                    }
+        sdpObserver.initiator = true;
+        executor.execute(() -> {
+            prepareNewConnection();
+            peerConnection.createOffer(sdpObserver, mediaConstraints);
+        });
 
-                    @Override
-                    public void onSetSuccess() {
-                        Log.d(TAG, "setLocalDescription onSetSuccess");
-                    }
-
-                    @Override
-                    public void onCreateFailure(String s) {
-                        Log.d(TAG, "setLocalDescription onCreateFailure");
-                    }
-
-                    @Override
-                    public void onSetFailure(String s) {
-                        Log.d(TAG, "setLocalDescription onSetFailure");
-                    }
-                }, sessionDescription);
-            }
-
-            @Override
-            public void onSetSuccess() {
-                Log.d(TAG, "createOffer onSetSuccess");
-            }
-
-            @Override
-            public void onCreateFailure(String s) {
-                Log.d(TAG, "createOffer onCreateFailure");
-            }
-
-            @Override
-            public void onSetFailure(String s) {
-                Log.d(TAG, "createOffer onSetFilure");
-            }
-        }, new MediaConstraints());
     }
 
     public void sendMessage(View view) {
         ByteBuffer color = ByteBuffer.allocate(3);
-        color.put((byte) ((SeekBar) view.findViewById(R.id.red)).getProgress());
-        color.put((byte) ((SeekBar) view.findViewById(R.id.green)).getProgress());
-        color.put((byte) ((SeekBar) view.findViewById(R.id.blue)).getProgress());
-        wsf.setCallback((e, ws) -> {
-            ws.send(color.array());
+        View v = view.getRootView();
+        color.put((byte) ((SeekBar) v.findViewById(R.id.red)).getProgress());
+        color.put((byte) ((SeekBar) v.findViewById(R.id.green)).getProgress());
+        color.put((byte) ((SeekBar) v.findViewById(R.id.blue)).getProgress());
+        color.flip();
+        executor.execute(() -> {
+            Log.d(TAG, "send start.");
+            dataChannel.send(new DataChannel.Buffer(ByteBuffer.wrap(String.valueOf(color.limit()).getBytes(Charset.forName("UTF-8"))), false));
+            dataChannel.send(new DataChannel.Buffer(color, true));
+            Log.d(TAG, "send: " + Arrays.toString(color.array()));
         });
+    }
+
+    private void sendSdp(SessionDescription.Type type, String sdp) {
+        wsf.setCallback((e, ws) -> {
+            if (e != null) {
+                Log.e(TAG, "WebSocket の通信で例外", e);
+                return;
+            }
+            String msg = String.format("{\"type\":\"%s\",\"sdp\":\"%s\"}",
+                    type.toString().toLowerCase(),
+                    sdp.replaceAll("\r\n", "\\\\r\\\\n"));
+            ws.send(msg);
+            Log.d(TAG, "SDP=" + sdp);
+        });
+    }
+
+    private class MySdpObserver implements SdpObserver {
+        private boolean initiator = false;
+
+        @Override
+        public void onCreateSuccess(SessionDescription sessionDescription) {
+            Log.d(TAG, "onCreateSuccess setLocalDescription");
+            executor.execute(() -> {
+                peerConnection.setLocalDescription(sdpObserver, sessionDescription);
+                wsf.setCallback((e, ws) -> {
+                    if (e != null) {
+                        Log.e(TAG, "WebSocket の通信で例外", e);
+                        return;
+                    }
+                    sendSdp(initiator ? SessionDescription.Type.OFFER : SessionDescription.Type.ANSWER, peerConnection.getLocalDescription().description);
+                });
+            });
+        }
+
+        @Override
+        public void onSetSuccess() {
+            Log.d(TAG, "onSetSuccess");
+        }
+
+        @Override
+        public void onCreateFailure(String s) {
+            Log.e(TAG, "onCreateFailure: " + s);
+        }
+
+        @Override
+        public void onSetFailure(String s) {
+            Log.e(TAG, "onSetFailure: " + s);
+        }
+    }
+
+    private class DataChannelObserver implements DataChannel.Observer {
+        @Override
+        public void onBufferedAmountChange(long l) {
+            Log.d(TAG, "DataChannel onBufferedAmountChange: " + l);
+        }
+
+        @Override
+        public void onStateChange() {
+            executor.execute(() -> Log.d(TAG, "DataChannel onStateChange. "));
+        }
+
+        @Override
+        public void onMessage(DataChannel.Buffer buffer) {
+            if (!buffer.binary) {
+                Log.d(TAG, buffer.data.toString());
+                return;
+            }
+            int color = Color.rgb(buffer.data.get(), buffer.data.get(), buffer.data.get());
+            runOnUiThread(() -> findViewById(R.id.textView).getRootView().setBackgroundColor(color));
+        }
     }
 }
